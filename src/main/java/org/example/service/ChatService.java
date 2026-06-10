@@ -2,7 +2,6 @@ package org.example.service;
 
 import com.alibaba.cloud.ai.dashscope.api.DashScopeApi;
 import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatModel;
-import com.alibaba.cloud.ai.dashscope.chat.DashScopeChatOptions;
 import com.alibaba.cloud.ai.graph.agent.ReactAgent;
 import com.alibaba.cloud.ai.graph.exception.GraphRunnerException;
 import org.example.agent.tool.DateTimeTools;
@@ -14,7 +13,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.ToolCallbackProvider;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
@@ -41,19 +39,20 @@ public class ChatService {
     @Autowired(required = false)  // Mock 模式下才注册，所以设置为 optional,真实环境通过mcp配置注入
     private QueryLogsTools queryLogsTools;
 
-    @Autowired
+    @Autowired(required = false)
     private ToolCallbackProvider tools;
 
-    @Value("${spring.ai.dashscope.api-key}")
-    private String dashScopeApiKey;
+    @Autowired
+    private ChatSessionService chatSessionService;
+
+    @Autowired
+    private DashScopeModelFactory modelFactory;
 
     /**
      * 创建 DashScope API 实例
      */
     public DashScopeApi createDashScopeApi() {
-        return DashScopeApi.builder()
-                .apiKey(dashScopeApiKey)
-                .build();
+        return modelFactory.createDashScopeApi();
     }
 
     /**
@@ -63,22 +62,62 @@ public class ChatService {
      * @param topP 核采样参数
      */
     public DashScopeChatModel createChatModel(DashScopeApi dashScopeApi, double temperature, int maxToken, double topP) {
-        return DashScopeChatModel.builder()
-                .dashScopeApi(dashScopeApi)
-                .defaultOptions(DashScopeChatOptions.builder()
-                        .withModel(DashScopeChatModel.DEFAULT_MODEL_NAME)
-                        .withTemperature(temperature)
-                        .withMaxToken(maxToken)
-                        .withTopP(topP)
-                        .build())
-                .build();
+        return modelFactory.createChatModel(dashScopeApi, temperature, maxToken, topP);
     }
 
     /**
      * 创建标准对话 ChatModel（默认参数）
      */
     public DashScopeChatModel createStandardChatModel(DashScopeApi dashScopeApi) {
-        return createChatModel(dashScopeApi, 0.7, 2000, 0.9);
+        return modelFactory.createStandardChatModel(dashScopeApi);
+    }
+
+    /**
+     * 创建用于对话摘要的 ChatModel（低温度、较短输出）
+     */
+    public DashScopeChatModel createSummaryChatModel(DashScopeApi dashScopeApi) {
+        return modelFactory.createSummaryChatModel(dashScopeApi);
+    }
+
+    /**
+     * 准备一次 ReactAgent 对话所需的上下文（/chat 与 /chat_stream 共用）
+     */
+    public ChatContext prepareChatContext(String sessionId) {
+        ChatSessionService.SessionInfo session = chatSessionService.getOrCreateSession(sessionId);
+        List<Map<String, String>> history = session.getHistory();
+        logger.info("准备对话上下文 - SessionId: {}, 历史轮数(含摘要): {}", sessionId, session.getMessagePairCount());
+
+        DashScopeApi dashScopeApi = createDashScopeApi();
+        DashScopeChatModel chatModel = createStandardChatModel(dashScopeApi);
+        logAvailableTools();
+
+        String systemPrompt = buildSystemPrompt(history);
+        ReactAgent agent = createReactAgent(chatModel, systemPrompt);
+
+        return new ChatContext(session, chatModel, agent, history);
+    }
+
+    /**
+     * 记录一轮对话并触发摘要压缩（/chat 与 /chat_stream 共用）
+     */
+    public void recordChatTurn(String sessionId, String userQuestion, String aiAnswer) {
+        chatSessionService.addMessageWithCompression(sessionId, userQuestion, aiAnswer);
+        ChatSessionService.SessionInfo session = chatSessionService.getSession(sessionId);
+        if (session != null) {
+            logger.info("已更新会话历史 - SessionId: {}, 当前轮数(含摘要): {}",
+                    sessionId, session.getMessagePairCount());
+        }
+    }
+
+    /**
+     * 一次对话的共享上下文
+     */
+    public record ChatContext(
+            ChatSessionService.SessionInfo session,
+            DashScopeChatModel chatModel,
+            ReactAgent agent,
+            List<Map<String, String>> history
+    ) {
     }
 
     /**
@@ -102,7 +141,9 @@ public class ChatService {
             for (Map<String, String> msg : history) {
                 String role = msg.get("role");
                 String content = msg.get("content");
-                if ("user".equals(role)) {
+                if (ConversationSummaryService.SUMMARY_ROLE.equals(role)) {
+                    systemPromptBuilder.append("【历史对话摘要】\n").append(content).append("\n");
+                } else if ("user".equals(role)) {
                     systemPromptBuilder.append("用户: ").append(content).append("\n");
                 } else if ("assistant".equals(role)) {
                     systemPromptBuilder.append("助手: ").append(content).append("\n");
@@ -134,6 +175,9 @@ public class ChatService {
      * 获取工具回调列表，mcp服务提供的工具
      */
     public ToolCallback[] getToolCallbacks() {
+        if (tools == null) {
+            return new ToolCallback[0];
+        }
         return tools.getToolCallbacks();
     }
 
@@ -141,8 +185,12 @@ public class ChatService {
      * 记录可用工具列表：mcp服务提供的工具
      */
     public void logAvailableTools() {
-        ToolCallback[] toolCallbacks = tools.getToolCallbacks();
-        logger.info("可用工具列表:");
+        ToolCallback[] toolCallbacks = getToolCallbacks();
+        if (toolCallbacks.length == 0) {
+            logger.info("MCP 工具未启用，仅使用本地 @Tool 工具");
+            return;
+        }
+        logger.info("可用 MCP 工具列表:");
         for (ToolCallback toolCallback : toolCallbacks) {
             logger.info(">>> {}", toolCallback.getToolDefinition().name());
         }

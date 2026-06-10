@@ -23,7 +23,7 @@ milvus:
 spring:
   ai:
     dashscope:
-      api-key: sk-1353ec6bf4454ba591a2c439d4b4bc5d  # 从环境变量读取或使用默认值
+      api-key: ${DASHSCOPE_API_KEY:}  # 请设置环境变量 DASHSCOPE_API_KEY
       chat:
         options:
           timeout: 180000  # 超时时间180秒（3分钟）
@@ -35,10 +35,11 @@ spring:
           max-interval: 10000  # 最大重试间隔10秒
     
     # Spring AI MCP 客户端配置
-    # 如果使用mock数据，请注释这部分内容
+    # 本地开发/测试对话记忆时建议 enabled: false，避免连接腾讯云 SSE 超时导致启动失败
+    # 如需真实云日志，改为 true 并配置有效 sse-endpoint
     mcp:
       client:
-        enabled: true
+        enabled: false
         name: tencent-mcp-server
         version: 1.0.0
         request-timeout: 60s
@@ -52,7 +53,7 @@ spring:
 # 阿里云 DashScope Embedding API 配置
 dashscope:
   api:
-    key: sk-1353ec6bf4454ba591a2c439d4b4bc5d  # 从环境变量读取或使用默认值（用于自定义配置）
+    key: ${DASHSCOPE_API_KEY:}  # 与 spring.ai.dashscope.api-key 共用同一环境变量
   embedding:
     model: text-embedding-v4  # 阿里云文本向量化模型
 
@@ -71,8 +72,14 @@ rag:
 prometheus:
   base-url: http://localhost:9090
   timeout: 10  # 超时时间（秒）
-  mock-enabled: false  # 是否启用 Mock 模式（用于测试）
+  mock-enabled: true  # 本地测试建议 true；有真实 Prometheus 时改为 false
 
 # CLS 云日志服务配置
 cls:
-  mock-enabled: false  # 是否启用 Mock 模式（用于测试，设为 true 返回与告警关联的模拟日志数据）
+  mock-enabled: true  # 本地测试建议 true；MCP 关闭时用 Mock 日志工具
+
+# 对话记忆配置
+chat:
+  memory:
+    max-recent-pairs: 5      # 超过该轮数时触发摘要压缩
+    compress-batch-pairs: 5  # 每次压缩最早的对话轮数
